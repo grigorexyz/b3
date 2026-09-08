@@ -4,21 +4,23 @@ A small build system written in C++23, inspired by `make` (targets, prerequisite
 timestamp based rebuilds, phony targets) and by [nob](https://github.com/tsoding/nob.h)
 (the build script is a normal C++ program that recompiles itself).
 
-There is no configuration language: a build is described in `b3.cpp` by creating
-`b3::Target` objects and handing them to a `b3::Builder`.
+Everything — the library, the build script for b3 itself, the tests and the
+examples — lives in the single translation unit [`b3.cpp`](b3.cpp). There is no
+configuration language: a build is described by creating `b3::Target` objects
+and handing them to a `b3::Builder`.
 
 ## Bootstrap
 
 ```sh
-c++ -std=c++23 -Iinclude -o b3 b3.cpp src/*.cpp
-./b3            # builds build/libb3.a
-./b3 check      # builds and runs the tests
-./b3 clean      # removes the build directory
+c++ -std=c++23 -o b3 b3.cpp
+./b3             # compiles b3 into build/b3
+./b3 check       # runs the tests in a child process
+./b3 examples    # spawns one child process per example
+./b3 clean       # removes the build directory
 ```
 
 After the first bootstrap `./b3` recompiles and re-executes itself whenever
-`b3.cpp` or any file in `src/` changed, so the compiler command above is only
-ever needed once.
+`b3.cpp` changed, so the compiler command above is only ever needed once.
 
 ## Command line
 
@@ -32,22 +34,34 @@ ever needed once.
 | `-q`, `--quiet` | only print warnings and errors |
 | `-h`, `--help` | list the available targets |
 
-Any remaining arguments are target names; without one the default target passed
-to `runCommandLine` is built.
+Two flags are handled before the graph is even built, because they select an in
+process mode instead of a build:
 
-## Layout
-
-| Path | Contents |
+| Flag | Meaning |
 | --- | --- |
-| `include/b3/Log.hpp` | leveled logging built on `std::format` |
-| `include/b3/FileSystem.hpp` | timestamps, directory creation, out of date checks |
-| `include/b3/Command.hpp` | an argument vector that is executed without a shell |
-| `include/b3/Target.hpp` | a make style rule: outputs, inputs, dependencies, commands |
-| `include/b3/Builder.hpp` | the target graph and its depth first execution |
-| `include/b3/SelfRebuild.hpp` | nob style bootstrapping of the build script |
-| `src/` | the implementation of the library |
-| `tests/BuilderTests.cpp` | dependency free tests, run with `./b3 check` |
-| `b3.cpp` | the build script for b3 itself, and the example to copy |
+| `--self-test` | run the test suite |
+| `--example <name>` | run one example, or all of them with `all` |
+
+Any remaining arguments are target names; without one the default target is built.
+
+## Examples
+
+The examples are not files on disk. Each one materialises its own little project
+in a scratch directory under the temporary directory, from sources kept in
+`constexpr std::string_view` literals, and drives it with its own `b3::Builder`
+instance. The `examples` target spawns b3 itself once per example, so every
+example runs in a fresh process with a fresh graph.
+
+| Example | What it shows |
+| --- | --- |
+| `hello` | compile, link and run a single file program, then prove the second build does nothing |
+| `library` | archive a static library and link a program against it |
+| `pipeline` | phony targets, dry runs and how a failing command aborts a build |
+
+```sh
+./b3 --example hello
+./b3 --example all
+```
 
 ## Describing a build
 
@@ -55,7 +69,8 @@ to `runCommandLine` is built.
 b3::Builder builder;
 
 b3::Command compile;
-compile.appendAll("c++", "-std=c++23", "-c", "src/Main.cpp", "-o", "build/Main.o");
+compile.appendAll(b3::compilerExecutable(), b3::kStandardFlag, b3::kCompileOnlyFlag,
+                  "src/Main.cpp", b3::kOutputFlag, "build/Main.o");
 
 b3::Target object("compile:main");
 object.output("build/Main.o").input("src/Main.cpp").command(std::move(compile));
@@ -68,7 +83,12 @@ when one of its dependencies was rebuilt.
 
 ## Conventions
 
-* C++23, no third party dependencies.
+* C++23, one file, no third party dependencies.
+* Every fixed string is a `constexpr std::string_view`, from the log prefixes and
+  the command line flags to the sources the examples write out; `Command::appendAll`
+  accepts them directly.
+* `levelPrefix`, the flag comparisons and the example registry are `constexpr`,
+  and a handful of `static_assert`s check them at compile time.
 * Member variables use the `m_PascalCase` prefix, instances and functions use
   `camelCase`, types use `PascalCase`.
 * `Command` and `Builder` hide their state behind the pImpl pattern; ownership

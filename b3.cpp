@@ -22,6 +22,7 @@
 #include <format>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -147,6 +148,18 @@ using FileTime = std::filesystem::file_time_type;
 
 inline constexpr std::string_view kSourceExtension = ".cpp";
 
+inline constexpr std::string_view kPathEnvironmentVariable = "PATH";
+
+#if defined(_WIN32)
+inline constexpr char kPathSeparator = ';';
+#else
+inline constexpr char kPathSeparator = ':';
+#endif
+
+inline constexpr std::filesystem::perms kExecutablePermissions =
+    std::filesystem::perms::owner_exec | std::filesystem::perms::group_exec
+    | std::filesystem::perms::others_exec;
+
 /// Returns the last write time of a path, or std::nullopt when it does not exist.
 [[nodiscard]] inline std::optional<FileTime> modificationTime(const Path& path)
 {
@@ -200,6 +213,77 @@ inline bool writeFile(const Path& path, std::string_view content)
 
     stream << content;
     return stream.good();
+}
+
+/// Reads a whole file as bytes, or std::nullopt when it cannot be opened.
+[[nodiscard]] inline std::optional<std::string> readFile(const Path& path)
+{
+    std::ifstream stream(path, std::ios::binary);
+    if (!stream)
+    {
+        return std::nullopt;
+    }
+    return std::string(std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>());
+}
+
+/// Looks a program up the way a shell would: names that already contain a
+/// separator are only checked for existence, every other name is searched for
+/// in the directories of the PATH environment variable.
+[[nodiscard]] inline std::optional<Path> findExecutable(std::string_view name)
+{
+    const auto isExecutableFile = [](const Path& candidate)
+    {
+        std::error_code errorCode;
+        if (!std::filesystem::is_regular_file(candidate, errorCode))
+        {
+            return false;
+        }
+        const std::filesystem::perms permissions =
+            std::filesystem::status(candidate, errorCode).permissions();
+        if (errorCode)
+        {
+            return false;
+        }
+        return (permissions & kExecutablePermissions) != std::filesystem::perms::none;
+    };
+
+    if (name.empty())
+    {
+        return std::nullopt;
+    }
+
+    const Path requested{name};
+    if (requested.has_parent_path())
+    {
+        return isExecutableFile(requested) ? std::optional<Path>(requested) : std::nullopt;
+    }
+
+    const char* pathVariable = std::getenv(kPathEnvironmentVariable.data());
+    if (pathVariable == nullptr)
+    {
+        return std::nullopt;
+    }
+
+    std::string_view remaining(pathVariable);
+    while (!remaining.empty())
+    {
+        const std::size_t separator = remaining.find(kPathSeparator);
+        const std::string_view directory = remaining.substr(0, separator);
+        remaining = separator == std::string_view::npos ? std::string_view()
+                                                        : remaining.substr(separator + 1);
+        if (directory.empty())
+        {
+            continue;
+        }
+
+        Path candidate = Path(directory) / name;
+        if (isExecutableFile(candidate))
+        {
+            return candidate;
+        }
+    }
+
+    return std::nullopt;
 }
 
 /// True when an output is missing or when any input is newer than the oldest
@@ -552,6 +636,154 @@ private:
 };
 
 // ---------------------------------------------------------------------------
+// WebAssembly toolchains
+// ---------------------------------------------------------------------------
+
+/// The two ways b3 knows to produce a WebAssembly module.
+///
+/// Emscripten is the batteries included option: it ships a libc, a libc++ and
+/// a linker driver, and it can emit the JavaScript glue around the module.
+///
+/// Clang is the alternative and needs nothing but a stock LLVM with the
+/// WebAssembly backend and wasm-ld, which every recent clang++ install already
+/// has. It builds a freestanding module instead: no libc, no start symbol, and
+/// exported symbols have to be named explicitly.
+enum class WasmToolchain
+{
+    Emscripten,
+    Clang,
+};
+
+inline constexpr std::string_view kEmscriptenToolchainName = "emscripten";
+inline constexpr std::string_view kClangToolchainName = "clang";
+
+inline constexpr std::string_view kEmscriptenCompiler = "em++";
+inline constexpr std::string_view kClangCompiler = "clang++";
+
+inline constexpr std::string_view kEmscriptenEnvironmentVariable = "EMXX";
+inline constexpr std::string_view kClangWasmEnvironmentVariable = "WASM_CXX";
+inline constexpr std::string_view kWasmToolchainEnvironmentVariable = "B3_WASM";
+
+inline constexpr std::string_view kWasmModuleExtension = ".wasm";
+
+/// The first four bytes of every WebAssembly module, "\0asm".
+inline constexpr std::string_view kWasmMagic{"\0asm", 4};
+
+/// Flags that make clang++ emit a freestanding module. `--no-entry` drops the
+/// requirement for a `_start` symbol and `--allow-undefined` lets the module
+/// import host functions it does not define itself.
+inline constexpr std::string_view kClangWasmTargetFlag = "--target=wasm32-unknown-unknown";
+inline constexpr std::string_view kClangWasmFlags[] = {
+    "-nostdlib", "-fno-exceptions", "-fno-rtti", "-Wl,--no-entry", "-Wl,--allow-undefined",
+};
+inline constexpr std::string_view kClangWasmExportPrefix = "-Wl,--export=";
+
+/// Emscripten links its own runtime, so the module is only asked to be a
+/// standalone one and the exports are passed as a single linker setting.
+inline constexpr std::string_view kEmscriptenWasmFlags[] = {"-sSTANDALONE_WASM"};
+inline constexpr std::string_view kEmscriptenExportPrefix = "-sEXPORTED_FUNCTIONS=";
+inline constexpr std::string_view kEmscriptenExportSymbolPrefix = "_";
+inline constexpr std::string_view kEmscriptenExportSeparator = ",";
+
+[[nodiscard]] constexpr std::string_view toolchainName(WasmToolchain toolchain) noexcept
+{
+    return toolchain == WasmToolchain::Emscripten ? kEmscriptenToolchainName : kClangToolchainName;
+}
+
+/// The compiler a toolchain drives, before any environment override.
+[[nodiscard]] constexpr std::string_view toolchainCompiler(WasmToolchain toolchain) noexcept
+{
+    return toolchain == WasmToolchain::Emscripten ? kEmscriptenCompiler : kClangCompiler;
+}
+
+[[nodiscard]] constexpr std::string_view toolchainEnvironmentVariable(
+    WasmToolchain toolchain) noexcept
+{
+    return toolchain == WasmToolchain::Emscripten ? kEmscriptenEnvironmentVariable
+                                                  : kClangWasmEnvironmentVariable;
+}
+
+[[nodiscard]] constexpr std::optional<WasmToolchain> parseWasmToolchain(
+    std::string_view name) noexcept
+{
+    if (name == kEmscriptenToolchainName)
+    {
+        return WasmToolchain::Emscripten;
+    }
+    if (name == kClangToolchainName)
+    {
+        return WasmToolchain::Clang;
+    }
+    return std::nullopt;
+}
+
+/// The compiler to actually invoke, honouring EMXX respectively WASM_CXX.
+[[nodiscard]] inline std::string wasmCompilerExecutable(WasmToolchain toolchain)
+{
+    const std::string_view variable = toolchainEnvironmentVariable(toolchain);
+    if (const char* fromEnvironment = std::getenv(variable.data());
+        fromEnvironment != nullptr && *fromEnvironment != '\0')
+    {
+        return fromEnvironment;
+    }
+    return std::string(toolchainCompiler(toolchain));
+}
+
+[[nodiscard]] inline bool isWasmToolchainAvailable(WasmToolchain toolchain)
+{
+    return fs::findExecutable(wasmCompilerExecutable(toolchain)).has_value();
+}
+
+namespace detail
+{
+
+inline std::optional<WasmToolchain> g_WasmToolchainOverride;
+
+} // namespace detail
+
+/// Forces a toolchain, overriding both B3_WASM and the automatic detection.
+inline void setWasmToolchain(std::optional<WasmToolchain> toolchain)
+{
+    detail::g_WasmToolchainOverride = toolchain;
+}
+
+/// Picks a toolchain: an explicit override wins, then B3_WASM, then emscripten
+/// when it is installed, and clang++ as the alternative. Returns std::nullopt
+/// when neither compiler can be found.
+[[nodiscard]] inline std::optional<WasmToolchain> detectWasmToolchain()
+{
+    if (detail::g_WasmToolchainOverride.has_value())
+    {
+        return detail::g_WasmToolchainOverride;
+    }
+
+    if (const char* requested = std::getenv(kWasmToolchainEnvironmentVariable.data());
+        requested != nullptr && *requested != '\0')
+    {
+        const std::optional<WasmToolchain> parsed = parseWasmToolchain(requested);
+        if (!parsed.has_value())
+        {
+            logWarning("ignoring unknown {} value '{}'", kWasmToolchainEnvironmentVariable,
+                       requested);
+        }
+        else
+        {
+            return parsed;
+        }
+    }
+
+    for (const WasmToolchain candidate : {WasmToolchain::Emscripten, WasmToolchain::Clang})
+    {
+        if (isWasmToolchainAvailable(candidate))
+        {
+            return candidate;
+        }
+    }
+
+    return std::nullopt;
+}
+
+// ---------------------------------------------------------------------------
 // Builder
 // ---------------------------------------------------------------------------
 
@@ -573,10 +805,11 @@ inline constexpr std::string_view kQuietShortFlag = "-q";
 inline constexpr std::string_view kQuietLongFlag = "--quiet";
 inline constexpr std::string_view kHelpShortFlag = "-h";
 inline constexpr std::string_view kHelpLongFlag = "--help";
+inline constexpr std::string_view kWasmToolchainFlag = "--wasm-toolchain";
 
 inline constexpr std::string_view kUsage =
     "usage: b3 [-n|--dry-run] [-B|--always-make] [-v|--verbose] [-q|--quiet] "
-    "[--self-test] [--example <name>] [target...]";
+    "[--wasm-toolchain emscripten|clang] [--self-test] [--example <name>] [target...]";
 
 /// Owns the target graph and executes it. The graph storage and the traversal
 /// bookkeeping live behind a pImpl so that new scheduling strategies can be
@@ -833,12 +1066,29 @@ inline int Builder::runCommandLine(int argc, char* argv[], std::string_view defa
         {
             setLogLevel(LogLevel::Trace);
         }
+        else if (argument == kWasmToolchainFlag)
+        {
+            if (index + 1 >= argc)
+            {
+                logError("'{}' expects a toolchain name", kWasmToolchainFlag);
+                return 2;
+            }
+
+            const std::string_view name = argv[++index];
+            const std::optional<WasmToolchain> toolchain = parseWasmToolchain(name);
+            if (!toolchain.has_value())
+            {
+                logError("unknown WebAssembly toolchain '{}', expected {} or {}", name,
+                         kEmscriptenToolchainName, kClangToolchainName);
+                return 2;
+            }
+            setWasmToolchain(toolchain);
+        }
         else if (argument == kQuietShortFlag || argument == kQuietLongFlag)
         {
             setLogLevel(LogLevel::Warning);
         }
-        else if (argument == kHelpShortFlag || argument == kHelpLongFlag)
-        {
+        else if (argument == kHelpShortFlag || argument == kHelpLongFlag)        {
             logMessage(LogLevel::Error, kUsage);
             logMessage(LogLevel::Error, "targets:");
             for (const std::string& name : targetNames())
@@ -965,6 +1215,130 @@ inline void rebuildYourself(int argc,
     std::exit(exitCode < 0 ? 1 : exitCode);
 }
 
+// ---------------------------------------------------------------------------
+// WebAssembly modules
+// ---------------------------------------------------------------------------
+
+/// Describes a WebAssembly module and lowers it to a command for whichever
+/// toolchain was selected, so a build script never has to spell out the
+/// difference between em++ and a freestanding clang++ invocation.
+class WasmModule
+{
+public:
+    explicit WasmModule(fs::Path output)
+        : m_Output(std::move(output))
+    {
+    }
+
+    WasmModule& source(fs::Path path)
+    {
+        m_Sources.push_back(std::move(path));
+        return *this;
+    }
+
+    /// Requests that a symbol stays visible to the host.
+    WasmModule& exportSymbol(std::string symbol)
+    {
+        m_ExportedSymbols.push_back(std::move(symbol));
+        return *this;
+    }
+
+    /// Adds a flag that is passed to whichever compiler is used.
+    WasmModule& flag(std::string flag)
+    {
+        m_ExtraFlags.push_back(std::move(flag));
+        return *this;
+    }
+
+    [[nodiscard]] const fs::Path& output() const { return m_Output; }
+    [[nodiscard]] const std::vector<fs::Path>& sources() const { return m_Sources; }
+    [[nodiscard]] const std::vector<std::string>& exportedSymbols() const
+    {
+        return m_ExportedSymbols;
+    }
+    [[nodiscard]] const std::vector<std::string>& extraFlags() const { return m_ExtraFlags; }
+
+    [[nodiscard]] Command compileCommand(WasmToolchain toolchain) const
+    {
+        Command command;
+        command.appendAll(wasmCompilerExecutable(toolchain), kStandardFlag, kOptimizeFlag);
+
+        if (toolchain == WasmToolchain::Clang)
+        {
+            command.append(std::string(kClangWasmTargetFlag));
+            for (const std::string_view flag : kClangWasmFlags)
+            {
+                command.append(std::string(flag));
+            }
+            for (const std::string& symbol : m_ExportedSymbols)
+            {
+                command.append(std::string(kClangWasmExportPrefix) + symbol);
+            }
+        }
+        else
+        {
+            for (const std::string_view flag : kEmscriptenWasmFlags)
+            {
+                command.append(std::string(flag));
+            }
+            if (!m_ExportedSymbols.empty())
+            {
+                std::string exports(kEmscriptenExportPrefix);
+                bool isFirst = true;
+                for (const std::string& symbol : m_ExportedSymbols)
+                {
+                    if (!isFirst)
+                    {
+                        exports += kEmscriptenExportSeparator;
+                    }
+                    isFirst = false;
+                    exports += kEmscriptenExportSymbolPrefix;
+                    exports += symbol;
+                }
+                command.append(std::move(exports));
+            }
+        }
+
+        for (const std::string& flag : m_ExtraFlags)
+        {
+            command.append(flag);
+        }
+
+        command.appendAll(kOutputFlag, m_Output.string());
+        for (const fs::Path& source : m_Sources)
+        {
+            command.append(source.string());
+        }
+
+        return command;
+    }
+
+    /// A ready made target, so a module drops straight into a build graph.
+    [[nodiscard]] Target target(std::string name, WasmToolchain toolchain) const
+    {
+        Target target(std::move(name));
+        target.output(m_Output).command(compileCommand(toolchain));
+        for (const fs::Path& source : m_Sources)
+        {
+            target.input(source);
+        }
+        return target;
+    }
+
+private:
+    fs::Path m_Output;
+    std::vector<fs::Path> m_Sources;
+    std::vector<std::string> m_ExportedSymbols;
+    std::vector<std::string> m_ExtraFlags;
+};
+
+/// True when the file really is a WebAssembly module, checked by its magic.
+[[nodiscard]] inline bool isWasmModule(const fs::Path& path)
+{
+    const std::optional<std::string> content = fs::readFile(path);
+    return content.has_value() && std::string_view(*content).starts_with(kWasmMagic);
+}
+
 } // namespace b3
 
 // ---------------------------------------------------------------------------
@@ -980,6 +1354,7 @@ namespace b3::examples
 
 inline constexpr std::string_view kExampleFlag = "--example";
 inline constexpr std::string_view kAllExamples = "all";
+inline constexpr std::string_view kWasmExampleName = "wasm";
 inline constexpr std::string_view kScratchDirectoryName = "b3-examples";
 
 inline constexpr std::string_view kHelloSource = R"(#include <iostream>
@@ -1014,6 +1389,26 @@ int main()
     return 0;
 }
 )";
+
+/// A freestanding translation unit: it uses no libc, so the very same source
+/// builds with emscripten and with a plain clang++ targeting wasm32.
+inline constexpr std::string_view kWasmSource = R"(extern "C" int add(int left, int right)
+{
+    return left + right;
+}
+
+extern "C" int factorial(int value)
+{
+    int result = 1;
+    for (int factor = 2; factor <= value; ++factor)
+    {
+        result *= factor;
+    }
+    return result;
+}
+)";
+
+inline constexpr std::string_view kWasmExportedSymbols[] = {"add", "factorial"};
 
 /// A named example together with the function that runs it.
 struct Example
@@ -1186,10 +1581,73 @@ struct Example
     return builder.build("broken") == BuildStatus::Failed;
 }
 
-inline constexpr std::array<Example, 3> kExamples{{
+/// Builds a WebAssembly module with whichever toolchain is installed. The same
+/// freestanding source is fed to emscripten and to a plain clang++ targeting
+/// wasm32; only the flags differ, and WasmModule knows about those.
+[[nodiscard]] inline bool runWasmExample(const fs::Path& directory)
+{
+    const std::optional<WasmToolchain> toolchain = detectWasmToolchain();
+    if (!toolchain.has_value())
+    {
+        logWarning("neither {} nor {} is installed, skipping the WebAssembly example",
+                   kEmscriptenCompiler, kClangCompiler);
+        return true;
+    }
+
+    logInfo("using the {} toolchain ({})", toolchainName(*toolchain),
+            wasmCompilerExecutable(*toolchain));
+
+    if (!isWasmToolchainAvailable(*toolchain))
+    {
+        logError("the {} toolchain was requested but '{}' is not on the PATH",
+                 toolchainName(*toolchain), wasmCompilerExecutable(*toolchain));
+        return false;
+    }
+
+    const fs::Path source = directory / "Math.cpp";
+    const fs::Path module = fs::Path(directory / "math").concat(kWasmModuleExtension);
+
+    if (!fs::writeFile(source, kWasmSource))
+    {
+        return false;
+    }
+
+    WasmModule wasmModule(module);
+    wasmModule.source(source);
+    for (const std::string_view symbol : kWasmExportedSymbols)
+    {
+        wasmModule.exportSymbol(std::string(symbol));
+    }
+
+    Builder builder;
+    builder.addTarget(wasmModule.target("wasm", *toolchain));
+
+    if (builder.build("wasm") != BuildStatus::Rebuilt)
+    {
+        logError("the module should have been built");
+        return false;
+    }
+    if (!isWasmModule(module))
+    {
+        logError("'{}' is not a WebAssembly module", module.string());
+        return false;
+    }
+    if (builder.build("wasm") != BuildStatus::UpToDate)
+    {
+        logError("the second build should have been a no operation");
+        return false;
+    }
+
+    logInfo("built '{}' exporting {} symbol(s)", module.filename().string(),
+            wasmModule.exportedSymbols().size());
+    return true;
+}
+
+inline constexpr std::array<Example, 4> kExamples{{
     {"hello", "compile, link and run a single file program", &runHelloExample},
     {"library", "archive a static library and link against it", &runLibraryExample},
     {"pipeline", "phony targets, dry runs and failing commands", &runPipelineExample},
+    {"wasm", "build a module with emscripten or with clang++", &runWasmExample},
 }};
 
 [[nodiscard]] inline const Example* findExample(std::string_view name)
@@ -1405,16 +1863,94 @@ inline void testTargetRegistry()
 inline void testExampleRegistry()
 {
     check(examples::findExample("hello") != nullptr, "known example is found");
+    check(examples::findExample("wasm") != nullptr, "the wasm example is registered");
     check(examples::findExample("nope") == nullptr, "unknown example is not found");
     check(examples::runExample("nope") == 2, "unknown example reports a usage error");
+}
+
+inline void testFindExecutable(const fs::Path& scratch)
+{
+    check(fs::findExecutable("sh").has_value(), "a program on the PATH is found");
+    check(!fs::findExecutable("b3-definitely-not-a-program").has_value(),
+          "a missing program is not found");
+    check(!fs::findExecutable("").has_value(), "an empty name is not a program");
+
+    const fs::Path plainFile = scratch / "not-executable.txt";
+    check(fs::writeFile(plainFile, kPayload), "executable lookup fixture");
+    check(!fs::findExecutable(plainFile.string()).has_value(),
+          "a path that is not executable is rejected");
+}
+
+inline void testWasmToolchainSelection()
+{
+    check(parseWasmToolchain(kEmscriptenToolchainName) == WasmToolchain::Emscripten,
+          "emscripten is parsed by name");
+    check(parseWasmToolchain(kClangToolchainName) == WasmToolchain::Clang,
+          "clang is parsed by name");
+    check(!parseWasmToolchain("nope").has_value(), "an unknown toolchain name is rejected");
+
+    setWasmToolchain(WasmToolchain::Clang);
+    check(detectWasmToolchain() == WasmToolchain::Clang, "an override wins over detection");
+    setWasmToolchain(WasmToolchain::Emscripten);
+    check(detectWasmToolchain() == WasmToolchain::Emscripten, "the override can be changed");
+    setWasmToolchain(std::nullopt);
+}
+
+inline void testWasmCommands()
+{
+    WasmModule module(fs::Path("build/math.wasm"));
+    module.source(fs::Path("Math.cpp")).exportSymbol("add").exportSymbol("factorial");
+
+    const std::string clangCommand = module.compileCommand(WasmToolchain::Clang).render();
+    check(clangCommand.contains(kClangWasmTargetFlag), "clang++ is pointed at wasm32");
+    check(clangCommand.contains("-nostdlib") && clangCommand.contains("-Wl,--no-entry"),
+          "clang++ builds a freestanding module");
+    check(clangCommand.contains("-Wl,--export=add")
+              && clangCommand.contains("-Wl,--export=factorial"),
+          "clang++ exports every requested symbol");
+    check(clangCommand.contains("-o build/math.wasm") && clangCommand.ends_with("Math.cpp"),
+          "the module and its sources are passed on");
+
+    const std::string emscriptenCommand =
+        module.compileCommand(WasmToolchain::Emscripten).render();
+    check(emscriptenCommand.starts_with(kEmscriptenCompiler), "emscripten drives em++");
+    check(emscriptenCommand.contains("-sSTANDALONE_WASM"), "emscripten builds a standalone module");
+    check(emscriptenCommand.contains("-sEXPORTED_FUNCTIONS=_add,_factorial"),
+          "emscripten exports the underscored symbol list");
+    check(!emscriptenCommand.contains(kClangWasmTargetFlag),
+          "emscripten does not need a target triple");
+
+    const Target target = module.target("wasm", WasmToolchain::Clang);
+    check(target.outputs().size() == 1 && target.inputs().size() == 1,
+          "a module target carries its output and its sources");
+    check(!target.isPhony(), "a module target is not phony");
+}
+
+inline void testWasmModuleDetection(const fs::Path& scratch)
+{
+    const fs::Path notAModule = scratch / "not-a-module.wasm";
+    check(fs::writeFile(notAModule, kPayload), "module detection fixture");
+    check(!isWasmModule(notAModule), "a text file is not a module");
+    check(!isWasmModule(scratch / "missing.wasm"), "a missing file is not a module");
+
+    const fs::Path module = scratch / "module.wasm";
+    check(fs::writeFile(module, kWasmMagic), "module magic fixture");
+    check(isWasmModule(module), "the magic bytes identify a module");
 }
 
 /// Compile time checks: none of these produce any code.
 static_assert(levelPrefix(LogLevel::Error) == kErrorPrefix);
 static_assert(kUsage.starts_with("usage:"));
 static_assert(fs::kSourceExtension == ".cpp");
-static_assert(examples::kExamples.size() == 3);
+static_assert(examples::kExamples.size() == 4);
 static_assert(examples::kExamples.front().m_Name == "hello");
+static_assert(examples::kExamples.back().m_Name == "wasm");
+static_assert(toolchainName(WasmToolchain::Clang) == kClangToolchainName);
+static_assert(toolchainCompiler(WasmToolchain::Emscripten) == kEmscriptenCompiler);
+static_assert(parseWasmToolchain(kClangToolchainName) == WasmToolchain::Clang);
+static_assert(!parseWasmToolchain("wasi").has_value());
+static_assert(kClangWasmTargetFlag.starts_with("--target=wasm32"));
+static_assert(kWasmMagic.size() == 4 && kWasmMagic[1] == 'a');
 
 [[nodiscard]] inline int runSelfTest()
 {
@@ -1432,6 +1968,10 @@ static_assert(examples::kExamples.front().m_Name == "hello");
     testDryRun(scratch);
     testTargetRegistry();
     testExampleRegistry();
+    testFindExecutable(scratch);
+    testWasmToolchainSelection();
+    testWasmCommands();
+    testWasmModuleDetection(scratch);
 
     std::filesystem::remove_all(scratch, errorCode);
 
@@ -1460,18 +2000,25 @@ inline constexpr std::string_view kBuildDirectory = "build";
 inline constexpr std::string_view kDefaultTarget = "build";
 inline constexpr std::string_view kCheckTarget = "check";
 inline constexpr std::string_view kExamplesTarget = "examples";
+inline constexpr std::string_view kWasmTarget = "wasm";
 inline constexpr std::string_view kCleanTarget = "clean";
 
 /// Spawns this very executable again with the given arguments. This is how the
-/// example and test targets get their own fresh process.
+/// example and test targets get their own fresh process; an explicitly
+/// requested WebAssembly toolchain is forwarded to the child.
 [[nodiscard]] b3::Command spawnSelf(std::string_view executable,
-                                    std::span<const std::string_view> arguments)
+                                    std::span<const std::string_view> arguments,
+                                    std::optional<std::string_view> wasmToolchain = std::nullopt)
 {
     b3::Command command;
     command.append(std::string(executable));
     for (const std::string_view argument : arguments)
     {
         command.append(std::string(argument));
+    }
+    if (wasmToolchain.has_value())
+    {
+        command.appendAll(b3::kWasmToolchainFlag, *wasmToolchain);
     }
     return command;
 }
@@ -1481,6 +2028,25 @@ inline constexpr std::string_view kCleanTarget = "clean";
 int main(int argc, char* argv[])
 {
     using namespace b3;
+
+    // The toolchain selection is applied first, because the in process modes
+    // below return before the regular flag parsing ever runs.
+    std::optional<std::string_view> requestedToolchain;
+    for (int index = 1; index + 1 < argc; ++index)
+    {
+        if (std::string_view(argv[index]) == kWasmToolchainFlag)
+        {
+            requestedToolchain = argv[index + 1];
+            const std::optional<WasmToolchain> toolchain = parseWasmToolchain(*requestedToolchain);
+            if (!toolchain.has_value())
+            {
+                logError("unknown WebAssembly toolchain '{}', expected {} or {}",
+                         *requestedToolchain, kEmscriptenToolchainName, kClangToolchainName);
+                return 2;
+            }
+            setWasmToolchain(toolchain);
+        }
+    }
 
     // The two in process modes are handled before anything else so that the
     // spawned children never re-enter the build graph.
@@ -1529,9 +2095,17 @@ int main(int argc, char* argv[])
     for (const examples::Example& example : examples::kExamples)
     {
         const std::array<std::string_view, 2> arguments{examples::kExampleFlag, example.m_Name};
-        runExamples.command(spawnSelf(executable, arguments));
+        runExamples.command(spawnSelf(executable, arguments, requestedToolchain));
     }
     builder.addTarget(std::move(runExamples));
+
+    // A shortcut for the WebAssembly example, which is the only target that
+    // cares about which of the two wasm toolchains is installed.
+    const std::array<std::string_view, 2> wasmArguments{examples::kExampleFlag,
+                                                        examples::kWasmExampleName};
+    Target wasm{std::string(kWasmTarget)};
+    wasm.command(spawnSelf(executable, wasmArguments, requestedToolchain));
+    builder.addTarget(std::move(wasm));
 
     Target clean{std::string(kCleanTarget)};
     clean.command(Command({"rm", "-rf", std::string(kBuildDirectory)}));

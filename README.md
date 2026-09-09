@@ -121,6 +121,15 @@ builder.addTarget(module.target("wasm"));
 ## Conventions
 
 * C++23, one file, no third party dependencies.
+* There is no `std::string` anywhere. Every string is a `std::string_view`, and
+  the few that only exist at run time — a rendered command line, a concatenated
+  flag, the contents of a file — are copied once into `b3::text::Arena`, which
+  owns them until the process exits.
+* Arena blocks are NUL terminated, so an interned view is also a valid
+  `const char*`: `Command::run` hands the very same characters to `execvp`
+  without a copy.
+* Log messages are formatted into a stack buffer with `std::format_to_n`, so
+  even printing never allocates a string.
 * Every fixed string is a `constexpr std::string_view`, from the log prefixes and
   the command line flags to the sources the examples write out; `Command::appendAll`
   accepts them directly.

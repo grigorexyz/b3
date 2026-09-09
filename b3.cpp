@@ -12,23 +12,27 @@
 /// functions use camelCase, types use PascalCase. Every fixed string in this
 /// file is a constexpr std::string_view so that nothing is allocated or copied
 /// for it at run time.
+///
+/// There is no std::string in b3. Strings are std::string_view throughout, and
+/// the few that have to be built while the program runs are copied once into
+/// b3::text::Arena, which owns the characters and NUL terminates them so the
+/// same views can be handed to C interfaces such as execvp as const char*.
 
 #include <algorithm>
 #include <array>
 #include <cerrno>
 #include <chrono>
+#include <cstddef>
 #include <cstdlib>
 #include <filesystem>
 #include <format>
 #include <fstream>
 #include <iostream>
-#include <iterator>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <span>
-#include <string>
 #include <string_view>
 #include <system_error>
 #include <utility>
@@ -112,29 +116,139 @@ inline void logMessage(LogLevel level, std::string_view message)
     stream << levelPrefix(level) << message << std::endl;
 }
 
+/// The largest message b3 ever prints. Formatting into a buffer of this size
+/// keeps std::format from having to return an owning string; longer messages
+/// are truncated, which only ever affects logging.
+inline constexpr std::size_t kLogBufferSize = 8192;
+
+template <typename... Args>
+void logFormatted(LogLevel level, std::format_string<Args...> format, Args&&... args)
+{
+    if (level < logLevel())
+    {
+        return;
+    }
+
+    std::array<char, kLogBufferSize> buffer{};
+    const auto result =
+        std::format_to_n(buffer.data(), buffer.size(), format, std::forward<Args>(args)...);
+    const std::size_t size =
+        std::min(static_cast<std::size_t>(result.size), buffer.size());
+    logMessage(level, std::string_view(buffer.data(), size));
+}
+
 template <typename... Args>
 void logTrace(std::format_string<Args...> format, Args&&... args)
 {
-    logMessage(LogLevel::Trace, std::format(format, std::forward<Args>(args)...));
+    logFormatted(LogLevel::Trace, format, std::forward<Args>(args)...);
 }
 
 template <typename... Args>
 void logInfo(std::format_string<Args...> format, Args&&... args)
 {
-    logMessage(LogLevel::Info, std::format(format, std::forward<Args>(args)...));
+    logFormatted(LogLevel::Info, format, std::forward<Args>(args)...);
 }
 
 template <typename... Args>
 void logWarning(std::format_string<Args...> format, Args&&... args)
 {
-    logMessage(LogLevel::Warning, std::format(format, std::forward<Args>(args)...));
+    logFormatted(LogLevel::Warning, format, std::forward<Args>(args)...);
 }
 
 template <typename... Args>
 void logError(std::format_string<Args...> format, Args&&... args)
 {
-    logMessage(LogLevel::Error, std::format(format, std::forward<Args>(args)...));
+    logFormatted(LogLevel::Error, format, std::forward<Args>(args)...);
 }
+
+// ---------------------------------------------------------------------------
+// Text
+// ---------------------------------------------------------------------------
+
+namespace text
+{
+
+/// Owns every stretch of characters that b3 has to build while it runs, such
+/// as a rendered command line or a concatenated flag. Views handed out by the
+/// arena stay valid until the process exits and are always NUL terminated, so
+/// data() is a legal const char* for execvp and friends.
+class Arena
+{
+public:
+    Arena() = default;
+    ~Arena() = default;
+
+    Arena(const Arena&) = delete;
+    Arena& operator=(const Arena&) = delete;
+    Arena(Arena&&) = delete;
+    Arena& operator=(Arena&&) = delete;
+
+    /// Copies the concatenation of the pieces into the arena.
+    [[nodiscard]] std::string_view store(std::span<const std::string_view> pieces)
+    {
+        std::size_t size = 0;
+        for (const std::string_view piece : pieces)
+        {
+            size += piece.size();
+        }
+
+        std::unique_ptr<char[]> block = std::make_unique<char[]>(size + 1);
+        char* cursor = block.get();
+        for (const std::string_view piece : pieces)
+        {
+            cursor = std::ranges::copy(piece, cursor).out;
+        }
+        *cursor = '\0';
+
+        const std::string_view stored(block.get(), size);
+
+        const std::scoped_lock lock(m_Mutex);
+        m_Blocks.push_back(std::move(block));
+        return stored;
+    }
+
+    [[nodiscard]] std::string_view store(std::string_view piece)
+    {
+        const std::array<std::string_view, 1> pieces{piece};
+        return store(std::span<const std::string_view>(pieces));
+    }
+
+private:
+    std::mutex m_Mutex;
+    std::vector<std::unique_ptr<char[]>> m_Blocks;
+};
+
+/// The one arena of the process. b3 is a short lived build tool, so nothing is
+/// ever released before it exits.
+[[nodiscard]] inline Arena& arena()
+{
+    static Arena instance;
+    return instance;
+}
+
+/// Copies a view into the arena, which makes its lifetime independent of
+/// whatever produced the characters.
+[[nodiscard]] inline std::string_view intern(std::string_view value)
+{
+    return arena().store(value);
+}
+
+/// Concatenates any number of views into a single interned view.
+template <typename... Parts>
+[[nodiscard]] std::string_view join(Parts&&... parts)
+{
+    const std::array<std::string_view, sizeof...(Parts)> pieces{
+        std::string_view(std::forward<Parts>(parts))...};
+    return arena().store(std::span<const std::string_view>(pieces));
+}
+
+/// The NUL terminated characters behind an interned view.
+[[nodiscard]] inline const char* cString(std::string_view interned)
+{
+    return interned.empty() && interned.data() == nullptr ? "" : interned.data();
+}
+
+} // namespace text
 
 // ---------------------------------------------------------------------------
 // File system helpers
@@ -159,6 +273,20 @@ inline constexpr char kPathSeparator = ':';
 inline constexpr std::filesystem::perms kExecutablePermissions =
     std::filesystem::perms::owner_exec | std::filesystem::perms::group_exec
     | std::filesystem::perms::others_exec;
+
+/// The characters of a path, without copying them. The view borrows from the
+/// path, so it must not outlive it; pass it through b3::text::intern when it
+/// has to.
+[[nodiscard]] inline std::string_view text(const Path& path)
+{
+#if defined(_WIN32)
+    // The native encoding is not char there, so this is the one place where a
+    // conversion cannot be avoided. The result is interned right away.
+    return b3::text::intern(path.string());
+#else
+    return path.native();
+#endif
+}
 
 /// Returns the last write time of a path, or std::nullopt when it does not exist.
 [[nodiscard]] inline std::optional<FileTime> modificationTime(const Path& path)
@@ -190,7 +318,7 @@ inline bool makeDirectories(const Path& path)
     std::filesystem::create_directories(path, errorCode);
     if (errorCode)
     {
-        logError("cannot create directory '{}': {}", path.string(), errorCode.message());
+        logError("cannot create directory '{}': {}", text(path), errorCode.message());
         return false;
     }
     return true;
@@ -207,7 +335,7 @@ inline bool writeFile(const Path& path, std::string_view content)
     std::ofstream stream(path, std::ios::binary | std::ios::trunc);
     if (!stream)
     {
-        logError("cannot write '{}'", path.string());
+        logError("cannot write '{}'", text(path));
         return false;
     }
 
@@ -215,15 +343,29 @@ inline bool writeFile(const Path& path, std::string_view content)
     return stream.good();
 }
 
-/// Reads a whole file as bytes, or std::nullopt when it cannot be opened.
-[[nodiscard]] inline std::optional<std::string> readFile(const Path& path)
+/// Reads a whole file into the text arena, or std::nullopt when it cannot be
+/// opened.
+[[nodiscard]] inline std::optional<std::string_view> readFile(const Path& path)
 {
-    std::ifstream stream(path, std::ios::binary);
+    std::ifstream stream(path, std::ios::binary | std::ios::ate);
     if (!stream)
     {
         return std::nullopt;
     }
-    return std::string(std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>());
+
+    const std::streamoff size = stream.tellg();
+    if (size < 0)
+    {
+        return std::nullopt;
+    }
+    stream.seekg(0, std::ios::beg);
+
+    std::vector<char> content(static_cast<std::size_t>(size));
+    if (size > 0 && !stream.read(content.data(), size))
+    {
+        return std::nullopt;
+    }
+    return b3::text::intern(std::string_view(content.data(), content.size()));
 }
 
 /// Looks a program up the way a shell would: names that already contain a
@@ -258,7 +400,7 @@ inline bool writeFile(const Path& path, std::string_view content)
         return isExecutableFile(requested) ? std::optional<Path>(requested) : std::nullopt;
     }
 
-    const char* pathVariable = std::getenv(kPathEnvironmentVariable.data());
+    const char* pathVariable = std::getenv(b3::text::cString(kPathEnvironmentVariable));
     if (pathVariable == nullptr)
     {
         return std::nullopt;
@@ -301,7 +443,7 @@ inline bool writeFile(const Path& path, std::string_view content)
         const std::optional<FileTime> time = modificationTime(output);
         if (!time.has_value())
         {
-            logTrace("output '{}' is missing", output.string());
+            logTrace("output '{}' is missing", text(output));
             return true;
         }
         if (!oldestOutput.has_value() || *time < *oldestOutput)
@@ -315,12 +457,12 @@ inline bool writeFile(const Path& path, std::string_view content)
         const std::optional<FileTime> time = modificationTime(input);
         if (!time.has_value())
         {
-            logTrace("input '{}' is missing", input.string());
+            logTrace("input '{}' is missing", text(input));
             return true;
         }
         if (*time > *oldestOutput)
         {
-            logTrace("input '{}' is newer than the outputs", input.string());
+            logTrace("input '{}' is newer than the outputs", text(input));
             return true;
         }
     }
@@ -340,7 +482,7 @@ inline bool writeFile(const Path& path, std::string_view content)
     std::filesystem::directory_iterator iterator(directory, errorCode);
     if (errorCode)
     {
-        logWarning("cannot list '{}': {}", directory.string(), errorCode.message());
+        logWarning("cannot list '{}': {}", text(directory), errorCode.message());
         return files;
     }
 
@@ -348,7 +490,7 @@ inline bool writeFile(const Path& path, std::string_view content)
     {
         if (errorCode)
         {
-            logWarning("cannot list '{}': {}", directory.string(), errorCode.message());
+            logWarning("cannot list '{}': {}", text(directory), errorCode.message());
             break;
         }
         if (!iterator->is_regular_file())
@@ -357,10 +499,11 @@ inline bool writeFile(const Path& path, std::string_view content)
         }
 
         const Path& path = iterator->path();
+        const Path extension = path.extension();
         const bool matches = extensions.empty()
             || std::ranges::any_of(extensions,
-                                   [&path](std::string_view extension)
-                                   { return path.extension().string() == extension; });
+                                   [&extension](std::string_view candidate)
+                                   { return text(extension) == candidate; });
         if (matches)
         {
             files.push_back(path);
@@ -380,13 +523,16 @@ inline bool writeFile(const Path& path, std::string_view content)
 inline constexpr std::string_view kQuotingCharacters = " \t\n\"'\\$&|;<>()";
 
 /// A single external process invocation, stored as an argument vector so that
-/// no shell quoting is ever required. The process handling state lives behind
-/// a pImpl so that the public interface stays free of platform headers.
+/// no shell quoting is ever required. Every argument is interned, which makes
+/// the command independent of the lifetime of whatever produced it and lets
+/// run() hand the very same characters to execvp. The process handling state
+/// lives behind a pImpl so that the public interface stays free of platform
+/// headers.
 class Command
 {
 public:
     Command();
-    explicit Command(std::vector<std::string> arguments);
+    Command(std::initializer_list<std::string_view> arguments);
     ~Command();
 
     Command(const Command& other);
@@ -394,24 +540,24 @@ public:
     Command(Command&& other) noexcept;
     Command& operator=(Command&& other) noexcept;
 
-    /// Appends a single argument.
-    Command& append(std::string argument);
+    /// Appends a single argument, copying its characters into the arena.
+    Command& append(std::string_view argument);
 
-    /// Appends any number of arguments convertible to std::string, which makes
-    /// constexpr std::string_view constants usable directly.
+    /// Appends any number of arguments convertible to std::string_view, which
+    /// makes constexpr std::string_view constants usable directly.
     template <typename... Args>
     Command& appendAll(Args&&... arguments)
     {
-        (append(std::string(std::forward<Args>(arguments))), ...);
+        (append(std::string_view(std::forward<Args>(arguments))), ...);
         return *this;
     }
 
-    [[nodiscard]] const std::vector<std::string>& arguments() const;
+    [[nodiscard]] std::span<const std::string_view> arguments() const;
 
     [[nodiscard]] bool empty() const;
 
     /// Human readable rendering of the command, used for logging only.
-    [[nodiscard]] std::string render() const;
+    [[nodiscard]] std::string_view render() const;
 
     /// Runs the command synchronously and returns its exit code. A negative
     /// value means the process could not be started or was terminated.
@@ -424,35 +570,34 @@ private:
 
 struct Command::Impl
 {
-    std::vector<std::string> m_Arguments;
+    std::vector<std::string_view> m_Arguments;
 };
 
 namespace detail
 {
 
-/// Quotes an argument for logging only, never for execution.
-[[nodiscard]] inline std::string renderArgument(std::string_view argument)
+/// Quotes an argument for logging only, never for execution. An argument that
+/// needs no quoting is returned as is, so nothing is copied for it.
+inline void renderArgument(std::string_view argument, std::vector<char>& out)
 {
     const bool needsQuotes =
         argument.empty() || argument.find_first_of(kQuotingCharacters) != std::string_view::npos;
     if (!needsQuotes)
     {
-        return std::string(argument);
+        out.insert(out.end(), argument.begin(), argument.end());
+        return;
     }
 
-    std::string quoted;
-    quoted.reserve(argument.size() + 2);
-    quoted.push_back('"');
+    out.push_back('"');
     for (const char character : argument)
     {
         if (character == '"' || character == '\\')
         {
-            quoted.push_back('\\');
+            out.push_back('\\');
         }
-        quoted.push_back(character);
+        out.push_back(character);
     }
-    quoted.push_back('"');
-    return quoted;
+    out.push_back('"');
 }
 
 } // namespace detail
@@ -462,9 +607,14 @@ inline Command::Command()
 {
 }
 
-inline Command::Command(std::vector<std::string> arguments)
-    : m_Impl(std::make_unique<Impl>(Impl{std::move(arguments)}))
+inline Command::Command(std::initializer_list<std::string_view> arguments)
+    : m_Impl(std::make_unique<Impl>())
 {
+    m_Impl->m_Arguments.reserve(arguments.size());
+    for (const std::string_view argument : arguments)
+    {
+        append(argument);
+    }
 }
 
 inline Command::~Command() = default;
@@ -487,13 +637,13 @@ inline Command::Command(Command&& other) noexcept = default;
 
 inline Command& Command::operator=(Command&& other) noexcept = default;
 
-inline Command& Command::append(std::string argument)
+inline Command& Command::append(std::string_view argument)
 {
-    m_Impl->m_Arguments.push_back(std::move(argument));
+    m_Impl->m_Arguments.push_back(text::intern(argument));
     return *this;
 }
 
-inline const std::vector<std::string>& Command::arguments() const
+inline std::span<const std::string_view> Command::arguments() const
 {
     return m_Impl->m_Arguments;
 }
@@ -503,34 +653,37 @@ inline bool Command::empty() const
     return m_Impl->m_Arguments.empty();
 }
 
-inline std::string Command::render() const
+inline std::string_view Command::render() const
 {
-    std::string rendered;
-    for (const std::string& argument : m_Impl->m_Arguments)
+    std::vector<char> rendered;
+    for (const std::string_view argument : m_Impl->m_Arguments)
     {
         if (!rendered.empty())
         {
             rendered.push_back(' ');
         }
-        rendered += detail::renderArgument(argument);
+        detail::renderArgument(argument, rendered);
     }
-    return rendered;
+    return text::intern(std::string_view(rendered.data(), rendered.size()));
 }
 
 inline int Command::run() const
 {
-    const std::vector<std::string>& arguments = m_Impl->m_Arguments;
+    const std::vector<std::string_view>& arguments = m_Impl->m_Arguments;
     if (arguments.empty())
     {
         logError("refusing to run an empty command");
         return -1;
     }
 
+    // Every argument came out of the arena and is therefore NUL terminated,
+    // so the characters can be pointed at directly. execvp only wants char*
+    // for historical reasons and never writes through them.
     std::vector<char*> rawArguments;
     rawArguments.reserve(arguments.size() + 1);
-    for (const std::string& argument : arguments)
+    for (const std::string_view argument : arguments)
     {
-        rawArguments.push_back(const_cast<char*>(argument.c_str()));
+        rawArguments.push_back(const_cast<char*>(text::cString(argument)));
     }
     rawArguments.push_back(nullptr);
 
@@ -587,12 +740,12 @@ inline int Command::run() const
 class Target
 {
 public:
-    explicit Target(std::string name)
-        : m_Name(std::move(name))
+    explicit Target(std::string_view name)
+        : m_Name(text::intern(name))
     {
     }
 
-    [[nodiscard]] const std::string& name() const { return m_Name; }
+    [[nodiscard]] std::string_view name() const { return m_Name; }
 
     /// A target without outputs is phony and therefore always runs, like a
     /// .PHONY target in make.
@@ -610,9 +763,9 @@ public:
         return *this;
     }
 
-    Target& dependsOn(std::string targetName)
+    Target& dependsOn(std::string_view targetName)
     {
-        m_Dependencies.push_back(std::move(targetName));
+        m_Dependencies.push_back(text::intern(targetName));
         return *this;
     }
 
@@ -624,14 +777,14 @@ public:
 
     [[nodiscard]] const std::vector<fs::Path>& outputs() const { return m_Outputs; }
     [[nodiscard]] const std::vector<fs::Path>& inputs() const { return m_Inputs; }
-    [[nodiscard]] const std::vector<std::string>& dependencies() const { return m_Dependencies; }
-    [[nodiscard]] const std::vector<Command>& commands() const { return m_Commands; }
+    [[nodiscard]] std::span<const std::string_view> dependencies() const { return m_Dependencies; }
+    [[nodiscard]] std::span<const Command> commands() const { return m_Commands; }
 
 private:
-    std::string m_Name;
+    std::string_view m_Name;
     std::vector<fs::Path> m_Outputs;
     std::vector<fs::Path> m_Inputs;
-    std::vector<std::string> m_Dependencies;
+    std::vector<std::string_view> m_Dependencies;
     std::vector<Command> m_Commands;
 };
 
@@ -665,14 +818,15 @@ inline constexpr std::string_view kWasmExportPrefix = "-Wl,--export=";
 
 /// The compiler to invoke, honouring WASM_CXX for cross compilers that are not
 /// simply called clang++.
-[[nodiscard]] inline std::string wasmCompilerExecutable()
+[[nodiscard]] inline std::string_view wasmCompilerExecutable()
 {
-    if (const char* fromEnvironment = std::getenv(kWasmCompilerEnvironmentVariable.data());
+    if (const char* fromEnvironment =
+            std::getenv(text::cString(kWasmCompilerEnvironmentVariable));
         fromEnvironment != nullptr && *fromEnvironment != '\0')
     {
         return fromEnvironment;
     }
-    return std::string(kWasmCompiler);
+    return kWasmCompiler;
 }
 
 [[nodiscard]] inline bool isWasmCompilerAvailable()
@@ -726,7 +880,7 @@ public:
 
     [[nodiscard]] bool hasTarget(std::string_view name) const;
     [[nodiscard]] const Target* findTarget(std::string_view name) const;
-    [[nodiscard]] std::vector<std::string> targetNames() const;
+    [[nodiscard]] std::vector<std::string_view> targetNames() const;
 
     /// When set, commands are only printed and never executed (make -n).
     void setDryRun(bool dryRun);
@@ -763,9 +917,10 @@ enum class VisitState
 
 struct Builder::Impl
 {
-    std::map<std::string, Target, std::less<>> m_Targets;
-    std::map<std::string, detail::VisitState, std::less<>> m_States;
-    std::map<std::string, BuildStatus, std::less<>> m_Results;
+    // The keys are interned target names, so the views outlive the maps.
+    std::map<std::string_view, Target, std::less<>> m_Targets;
+    std::map<std::string_view, detail::VisitState, std::less<>> m_States;
+    std::map<std::string_view, BuildStatus, std::less<>> m_Results;
     bool m_DryRun = false;
     bool m_AlwaysMake = false;
 
@@ -819,7 +974,7 @@ inline BuildStatus Builder::Impl::buildTarget(std::string_view name)
         return BuildStatus::Failed;
     }
 
-    const std::string targetName(name);
+    const std::string_view targetName = entry->second.name();
     if (m_States[targetName] == detail::VisitState::InProgress)
     {
         logError("dependency cycle detected at target '{}'", targetName);
@@ -833,7 +988,7 @@ inline BuildStatus Builder::Impl::buildTarget(std::string_view name)
     bool dependencyRebuilt = false;
     std::vector<fs::Path> inputs = target.inputs();
 
-    for (const std::string& dependency : target.dependencies())
+    for (const std::string_view dependency : target.dependencies())
     {
         const BuildStatus status = buildTarget(dependency);
         if (status == BuildStatus::Failed)
@@ -884,7 +1039,7 @@ inline Builder& Builder::operator=(Builder&& other) noexcept = default;
 
 inline Target& Builder::addTarget(Target target)
 {
-    const std::string name = target.name();
+    const std::string_view name = target.name();
     m_Impl->m_Results.clear();
     const auto [entry, inserted] = m_Impl->m_Targets.insert_or_assign(name, std::move(target));
     if (!inserted)
@@ -905,9 +1060,9 @@ inline const Target* Builder::findTarget(std::string_view name) const
     return entry == m_Impl->m_Targets.end() ? nullptr : &entry->second;
 }
 
-inline std::vector<std::string> Builder::targetNames() const
+inline std::vector<std::string_view> Builder::targetNames() const
 {
-    std::vector<std::string> names;
+    std::vector<std::string_view> names;
     names.reserve(m_Impl->m_Targets.size());
     for (const auto& [name, target] : m_Impl->m_Targets)
     {
@@ -945,7 +1100,7 @@ inline BuildStatus Builder::build(std::string_view name)
 
 inline int Builder::runCommandLine(int argc, char* argv[], std::string_view defaultTarget)
 {
-    std::vector<std::string> requestedTargets;
+    std::vector<std::string_view> requestedTargets;
 
     for (int index = 1; index < argc; ++index)
     {
@@ -970,9 +1125,9 @@ inline int Builder::runCommandLine(int argc, char* argv[], std::string_view defa
         {
             logMessage(LogLevel::Error, kUsage);
             logMessage(LogLevel::Error, "targets:");
-            for (const std::string& name : targetNames())
+            for (const std::string_view name : targetNames())
             {
-                logMessage(LogLevel::Error, "  " + name);
+                logError("  {}", name);
             }
             return 0;
         }
@@ -992,7 +1147,7 @@ inline int Builder::runCommandLine(int argc, char* argv[], std::string_view defa
         requestedTargets.emplace_back(defaultTarget);
     }
 
-    for (const std::string& name : requestedTargets)
+    for (const std::string_view name : requestedTargets)
     {
         const BuildStatus status = build(name);
         if (status == BuildStatus::Failed)
@@ -1021,14 +1176,14 @@ inline constexpr std::string_view kCompileOnlyFlag = "-c";
 inline constexpr std::string_view kWarningFlags[] = {"-Wall", "-Wextra"};
 inline constexpr std::string_view kBackupSuffix = ".old";
 
-[[nodiscard]] inline std::string compilerExecutable()
+[[nodiscard]] inline std::string_view compilerExecutable()
 {
-    if (const char* fromEnvironment = std::getenv(kCompilerEnvironmentVariable.data());
+    if (const char* fromEnvironment = std::getenv(text::cString(kCompilerEnvironmentVariable));
         fromEnvironment != nullptr && *fromEnvironment != '\0')
     {
         return fromEnvironment;
     }
-    return std::string(kDefaultCompiler);
+    return kDefaultCompiler;
 }
 
 /// When one of the sources of the build script is newer than the running
@@ -1051,26 +1206,26 @@ inline void rebuildYourself(int argc,
         return;
     }
 
-    logInfo("build script is out of date, rebuilding '{}'", executable.string());
+    logInfo("build script is out of date, rebuilding '{}'", fs::text(executable));
 
     const fs::Path backup = fs::Path(executable).concat(kBackupSuffix);
     std::error_code errorCode;
     std::filesystem::rename(executable, backup, errorCode);
     if (errorCode)
     {
-        logWarning("cannot move '{}' aside: {}", executable.string(), errorCode.message());
+        logWarning("cannot move '{}' aside: {}", fs::text(executable), errorCode.message());
     }
 
     Command compile;
     compile.appendAll(compilerExecutable(), kStandardFlag, kOptimizeFlag, kOutputFlag,
-                      executable.string());
+                      fs::text(executable));
     for (const fs::Path& source : sources)
     {
-        compile.append(source.string());
+        compile.append(fs::text(source));
     }
     for (const std::string_view flag : extraFlags)
     {
-        compile.append(std::string(flag));
+        compile.append(flag);
     }
 
     logInfo("{}", compile.render());
@@ -1086,10 +1241,10 @@ inline void rebuildYourself(int argc,
     Command restart;
     for (int index = 0; index < argc; ++index)
     {
-        restart.append(argv[index] == nullptr ? std::string() : std::string(argv[index]));
+        restart.append(argv[index] == nullptr ? std::string_view() : std::string_view(argv[index]));
     }
 
-    logInfo("restarting '{}'", executable.string());
+    logInfo("restarting '{}'", fs::text(executable));
     const int exitCode = restart.run();
     std::exit(exitCode < 0 ? 1 : exitCode);
 }
@@ -1115,26 +1270,26 @@ public:
     }
 
     /// Requests that a symbol stays visible to the host.
-    WasmModule& exportSymbol(std::string symbol)
+    WasmModule& exportSymbol(std::string_view symbol)
     {
-        m_ExportedSymbols.push_back(std::move(symbol));
+        m_ExportedSymbols.push_back(text::intern(symbol));
         return *this;
     }
 
     /// Adds a flag that is passed to the compiler as is.
-    WasmModule& flag(std::string flag)
+    WasmModule& flag(std::string_view flag)
     {
-        m_ExtraFlags.push_back(std::move(flag));
+        m_ExtraFlags.push_back(text::intern(flag));
         return *this;
     }
 
     [[nodiscard]] const fs::Path& output() const { return m_Output; }
     [[nodiscard]] const std::vector<fs::Path>& sources() const { return m_Sources; }
-    [[nodiscard]] const std::vector<std::string>& exportedSymbols() const
+    [[nodiscard]] std::span<const std::string_view> exportedSymbols() const
     {
         return m_ExportedSymbols;
     }
-    [[nodiscard]] const std::vector<std::string>& extraFlags() const { return m_ExtraFlags; }
+    [[nodiscard]] std::span<const std::string_view> extraFlags() const { return m_ExtraFlags; }
 
     [[nodiscard]] Command compileCommand() const
     {
@@ -1143,30 +1298,30 @@ public:
 
         for (const std::string_view flag : kWasmFlags)
         {
-            command.append(std::string(flag));
+            command.append(flag);
         }
-        for (const std::string& symbol : m_ExportedSymbols)
+        for (const std::string_view symbol : m_ExportedSymbols)
         {
-            command.append(std::string(kWasmExportPrefix) + symbol);
+            command.append(text::join(kWasmExportPrefix, symbol));
         }
-        for (const std::string& flag : m_ExtraFlags)
+        for (const std::string_view flag : m_ExtraFlags)
         {
             command.append(flag);
         }
 
-        command.appendAll(kOutputFlag, m_Output.string());
+        command.appendAll(kOutputFlag, fs::text(m_Output));
         for (const fs::Path& source : m_Sources)
         {
-            command.append(source.string());
+            command.append(fs::text(source));
         }
 
         return command;
     }
 
     /// A ready made target, so a module drops straight into a build graph.
-    [[nodiscard]] Target target(std::string name) const
+    [[nodiscard]] Target target(std::string_view name) const
     {
-        Target target(std::move(name));
+        Target target(name);
         target.output(m_Output).command(compileCommand());
         for (const fs::Path& source : m_Sources)
         {
@@ -1178,15 +1333,15 @@ public:
 private:
     fs::Path m_Output;
     std::vector<fs::Path> m_Sources;
-    std::vector<std::string> m_ExportedSymbols;
-    std::vector<std::string> m_ExtraFlags;
+    std::vector<std::string_view> m_ExportedSymbols;
+    std::vector<std::string_view> m_ExtraFlags;
 };
 
 /// True when the file really is a WebAssembly module, checked by its magic.
 [[nodiscard]] inline bool isWasmModule(const fs::Path& path)
 {
-    const std::optional<std::string> content = fs::readFile(path);
-    return content.has_value() && std::string_view(*content).starts_with(kWasmMagic);
+    const std::optional<std::string_view> content = fs::readFile(path);
+    return content.has_value() && content->starts_with(kWasmMagic);
 }
 
 } // namespace b3
@@ -1282,21 +1437,21 @@ struct Example
 [[nodiscard]] inline Target compileTarget(std::string_view name,
                                           const fs::Path& source,
                                           const fs::Path& object,
-                                          std::span<const std::string> flags = {})
+                                          std::span<const std::string_view> flags = {})
 {
     Command compile;
     compile.appendAll(compilerExecutable(), kStandardFlag);
     for (const std::string_view flag : kWarningFlags)
     {
-        compile.append(std::string(flag));
+        compile.append(flag);
     }
-    for (const std::string& flag : flags)
+    for (const std::string_view flag : flags)
     {
         compile.append(flag);
     }
-    compile.appendAll(kCompileOnlyFlag, source.string(), kOutputFlag, object.string());
+    compile.appendAll(kCompileOnlyFlag, fs::text(source), kOutputFlag, fs::text(object));
 
-    Target target{std::string(name)};
+    Target target{name};
     target.output(object).input(source).command(std::move(compile));
     return target;
 }
@@ -1318,14 +1473,14 @@ struct Example
     builder.addTarget(compileTarget("compile", source, object));
 
     Command link;
-    link.appendAll(compilerExecutable(), kStandardFlag, kOutputFlag, program.string(),
-                   object.string());
+    link.appendAll(compilerExecutable(), kStandardFlag, kOutputFlag, fs::text(program),
+                   fs::text(object));
     Target linkTarget("link");
     linkTarget.output(program).dependsOn("compile").command(std::move(link));
     builder.addTarget(std::move(linkTarget));
 
     Target run("run");
-    run.dependsOn("link").command(Command({program.string()}));
+    run.dependsOn("link").command(Command({fs::text(program)}));
     builder.addTarget(std::move(run));
 
     if (builder.build("link") != BuildStatus::Rebuilt)
@@ -1359,7 +1514,7 @@ struct Example
         return false;
     }
 
-    const std::vector<std::string> includeFlags{"-I" + directory.string()};
+    const std::array<std::string_view, 1> includeFlags{text::join("-I", fs::text(directory))};
 
     Builder builder;
     builder.addTarget(compileTarget("compile:greeter", greeterSource, greeterObject, includeFlags))
@@ -1368,20 +1523,20 @@ struct Example
         .input(header);
 
     Command archive;
-    archive.appendAll("ar", "rcs", library.string(), greeterObject.string());
+    archive.appendAll("ar", "rcs", fs::text(library), fs::text(greeterObject));
     Target archiveTarget("lib");
     archiveTarget.output(library).dependsOn("compile:greeter").command(std::move(archive));
     builder.addTarget(std::move(archiveTarget));
 
     Command link;
-    link.appendAll(compilerExecutable(), kStandardFlag, kOutputFlag, program.string(),
-                   mainObject.string(), library.string());
+    link.appendAll(compilerExecutable(), kStandardFlag, kOutputFlag, fs::text(program),
+                   fs::text(mainObject), fs::text(library));
     Target linkTarget("link");
     linkTarget.output(program).dependsOn("compile:main").dependsOn("lib").command(std::move(link));
     builder.addTarget(std::move(linkTarget));
 
     Target run("run");
-    run.dependsOn("link").command(Command({program.string()}));
+    run.dependsOn("link").command(Command({fs::text(program)}));
     builder.addTarget(std::move(run));
 
     return builder.build("run") == BuildStatus::Rebuilt;
@@ -1395,7 +1550,7 @@ struct Example
     Builder builder;
 
     Target generate("generate");
-    generate.output(stamp).command(Command({"touch", stamp.string()}));
+    generate.output(stamp).command(Command({"touch", fs::text(stamp)}));
     builder.addTarget(std::move(generate));
 
     Target report("report");
@@ -1456,7 +1611,7 @@ struct Example
     wasmModule.source(source);
     for (const std::string_view symbol : kWasmExportedSymbols)
     {
-        wasmModule.exportSymbol(std::string(symbol));
+        wasmModule.exportSymbol(symbol);
     }
 
     Builder builder;
@@ -1469,7 +1624,7 @@ struct Example
     }
     if (!isWasmModule(module))
     {
-        logError("'{}' is not a WebAssembly module", module.string());
+        logError("'{}' is not a WebAssembly module", fs::text(module));
         return false;
     }
     if (builder.build("wasm") != BuildStatus::UpToDate)
@@ -1478,7 +1633,8 @@ struct Example
         return false;
     }
 
-    logInfo("built '{}' exporting {} symbol(s)", module.filename().string(),
+    const fs::Path moduleName = module.filename();
+    logInfo("built '{}' exporting {} symbol(s)", fs::text(moduleName),
             wasmModule.exportedSymbols().size());
     return true;
 }
@@ -1518,8 +1674,7 @@ inline constexpr std::array<Example, 4> kExamples{{
         logMessage(LogLevel::Error, "examples:");
         for (const Example& known : kExamples)
         {
-            logMessage(LogLevel::Error,
-                       std::format("  {:<10} {}", known.m_Name, known.m_Description));
+            logError("  {:<10} {}", known.m_Name, known.m_Description);
         }
         return 2;
     }
@@ -1563,11 +1718,28 @@ inline void check(bool condition, std::string_view what)
 {
     if (condition)
     {
-        std::cout << kOkPrefix << what << '\n';
+        std::cout << kOkPrefix << what << std::endl;
         return;
     }
-    std::cout << kFailPrefix << what << '\n';
+    std::cout << kFailPrefix << what << std::endl;
     ++g_Failures;
+}
+
+inline void testTextArena()
+{
+    const std::string_view interned = text::intern("interned");
+    check(interned == "interned", "the arena keeps the characters");
+    check(text::cString(interned)[interned.size()] == '\0', "an interned view is NUL terminated");
+    check(text::join(kWasmExportPrefix, "add") == "-Wl,--export=add", "join concatenates");
+    check(text::join().empty(), "joining nothing gives an empty view");
+
+    // The characters of the source are gone by the time the view is read.
+    std::string_view copied;
+    {
+        const std::vector<char> temporary{'g', 'o', 'n', 'e'};
+        copied = text::intern(std::string_view(temporary.data(), temporary.size()));
+    }
+    check(copied == "gone", "an interned view outlives its source");
 }
 
 inline void testCommandRendering()
@@ -1577,6 +1749,14 @@ inline void testCommandRendering()
     check(command.arguments().size() == 3, "command keeps every argument");
     check(command.render() == R"(c++ -o "build/with space")", "command quotes for logging");
     check(Command().empty(), "default constructed command is empty");
+
+    // Arguments are copied, so a command never borrows from its caller.
+    Command borrowed;
+    {
+        const fs::Path source = fs::Path("build") / "Main.cpp";
+        borrowed.append(fs::text(source));
+    }
+    check(borrowed.render() == "build/Main.cpp", "an argument outlives what produced it");
 }
 
 inline void testCommandExecution()
@@ -1631,7 +1811,7 @@ inline void testBuilderRebuildsAndCaches(const fs::Path& scratch)
     Builder builder;
     Target copy("copy");
     Command copyCommand;
-    copyCommand.appendAll("cp", input.string(), output.string());
+    copyCommand.appendAll("cp", fs::text(input), fs::text(output));
     copy.output(output).input(input).command(std::move(copyCommand));
     builder.addTarget(std::move(copy));
 
@@ -1679,7 +1859,7 @@ inline void testDryRun(const fs::Path& scratch)
     Builder builder;
     Target touch("touch");
     Command touchCommand;
-    touchCommand.appendAll("touch", output.string());
+    touchCommand.appendAll("touch", fs::text(output));
     touch.output(output).command(std::move(touchCommand));
     builder.addTarget(std::move(touch));
 
@@ -1717,7 +1897,7 @@ inline void testFindExecutable(const fs::Path& scratch)
 
     const fs::Path plainFile = scratch / "not-executable.txt";
     check(fs::writeFile(plainFile, kPayload), "executable lookup fixture");
-    check(!fs::findExecutable(plainFile.string()).has_value(),
+    check(!fs::findExecutable(fs::text(plainFile)).has_value(),
           "a path that is not executable is rejected");
 }
 
@@ -1726,7 +1906,7 @@ inline void testWasmCommands()
     WasmModule module(fs::Path("build/math.wasm"));
     module.source(fs::Path("Math.cpp")).exportSymbol("add").exportSymbol("factorial");
 
-    const std::string command = module.compileCommand().render();
+    const std::string_view command = module.compileCommand().render();
     check(command.starts_with(wasmCompilerExecutable()), "the module is built with clang++");
     check(command.contains(kWasmTargetFlag), "clang++ is pointed at wasm32");
     check(command.contains("-nostdlib") && command.contains("-Wl,--no-entry"),
@@ -1736,7 +1916,7 @@ inline void testWasmCommands()
     check(command.contains("-o build/math.wasm") && command.ends_with("Math.cpp"),
           "the module and its sources are passed on");
 
-    const std::string withFlag =
+    const std::string_view withFlag =
         WasmModule(fs::Path("m.wasm")).flag("-DNDEBUG").compileCommand().render();
     check(withFlag.contains("-DNDEBUG"), "extra flags are passed through");
 
@@ -1776,6 +1956,7 @@ static_assert(kWasmMagic.size() == 4 && kWasmMagic[1] == 'a');
     std::filesystem::remove_all(scratch, errorCode);
     fs::makeDirectories(scratch);
 
+    testTextArena();
     testCommandRendering();
     testCommandExecution();
     testOutOfDateDetection(scratch);
@@ -1825,10 +2006,10 @@ inline constexpr std::string_view kCleanTarget = "clean";
                                     std::span<const std::string_view> arguments)
 {
     b3::Command command;
-    command.append(std::string(executable));
+    command.append(executable);
     for (const std::string_view argument : arguments)
     {
-        command.append(std::string(argument));
+        command.append(argument);
     }
     return command;
 }
@@ -1859,7 +2040,8 @@ int main(int argc, char* argv[])
     const std::array<fs::Path, 1> selfSources{fs::Path(kSelfSource)};
     rebuildYourself(argc, argv, selfSources);
 
-    const std::string executable = argc > 0 && argv[0] != nullptr ? argv[0] : "./b3";
+    const std::string_view executable =
+        argc > 0 && argv[0] != nullptr ? std::string_view(argv[0]) : std::string_view("./b3");
 
     Builder builder;
 
@@ -1867,22 +2049,22 @@ int main(int argc, char* argv[])
     compile.appendAll(compilerExecutable(), kStandardFlag);
     for (const std::string_view flag : kWarningFlags)
     {
-        compile.append(std::string(flag));
+        compile.append(flag);
     }
     compile.appendAll(kOutputFlag, kSelfBinary, kSelfSource);
 
-    Target build{std::string(kDefaultTarget)};
+    Target build{kDefaultTarget};
     build.output(fs::Path(kSelfBinary)).input(fs::Path(kSelfSource)).command(std::move(compile));
     builder.addTarget(std::move(build));
 
     const std::array<std::string_view, 1> selfTestArguments{tests::kSelfTestFlag};
-    Target check{std::string(kCheckTarget)};
+    Target check{kCheckTarget};
     check.command(spawnSelf(executable, selfTestArguments));
     builder.addTarget(std::move(check));
 
     // One child process per example, so a crashing example cannot take the
     // build script down with it.
-    Target runExamples{std::string(kExamplesTarget)};
+    Target runExamples{kExamplesTarget};
     for (const examples::Example& example : examples::kExamples)
     {
         const std::array<std::string_view, 2> arguments{examples::kExampleFlag, example.m_Name};
@@ -1893,12 +2075,12 @@ int main(int argc, char* argv[])
     // A shortcut for the WebAssembly example.
     const std::array<std::string_view, 2> wasmArguments{examples::kExampleFlag,
                                                         examples::kWasmExampleName};
-    Target wasm{std::string(kWasmTarget)};
+    Target wasm{kWasmTarget};
     wasm.command(spawnSelf(executable, wasmArguments));
     builder.addTarget(std::move(wasm));
 
-    Target clean{std::string(kCleanTarget)};
-    clean.command(Command({"rm", "-rf", std::string(kBuildDirectory)}));
+    Target clean{kCleanTarget};
+    clean.command(Command({"rm", "-rf", kBuildDirectory}));
     builder.addTarget(std::move(clean));
 
     return builder.runCommandLine(argc, argv, kDefaultTarget);

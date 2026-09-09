@@ -16,7 +16,7 @@ c++ -std=c++23 -o b3 b3.cpp
 ./b3             # compiles b3 into build/b3
 ./b3 check       # runs the tests in a child process
 ./b3 examples    # spawns one child process per example
-./b3 wasm        # builds a WebAssembly module
+./b3 wasm        # builds a freestanding WebAssembly module
 ./b3 clean       # removes the build directory
 ```
 
@@ -34,7 +34,6 @@ After the first bootstrap `./b3` recompiles and re-executes itself whenever
 | `-v`, `--verbose` | print trace output explaining rebuild decisions |
 | `-q`, `--quiet` | only print warnings and errors |
 | `-h`, `--help` | list the available targets |
-| `--wasm-toolchain <name>` | force `emscripten` or `clang` for WebAssembly builds |
 
 Two flags are handled before the graph is even built, because they select an in
 process mode instead of a build:
@@ -59,7 +58,7 @@ example runs in a fresh process with a fresh graph.
 | `hello` | compile, link and run a single file program, then prove the second build does nothing |
 | `library` | archive a static library and link a program against it |
 | `pipeline` | phony targets, dry runs and how a failing command aborts a build |
-| `wasm` | build a WebAssembly module with emscripten or with clang++ |
+| `wasm` | build a freestanding WebAssembly module with clang++ |
 
 ```sh
 ./b3 --example hello
@@ -68,29 +67,28 @@ example runs in a fresh process with a fresh graph.
 
 ## WebAssembly
 
+b3 targets WebAssembly with a plain `clang++` and nothing else — no emscripten,
+no SDK to install, no sysroot to activate. A stock LLVM with the WebAssembly
+backend and `wasm-ld`, which a recent `clang++` already ships with, is the whole
+toolchain.
+
 A `b3::WasmModule` describes a module — its output, its sources and the symbols
-it exports — and lowers it to a command for one of two toolchains:
+it exports — and lowers it to a single invocation:
 
-| Toolchain | Compiler | How the module is built |
-| --- | --- | --- |
-| `emscripten` | `em++` | `-sSTANDALONE_WASM`, exports as `-sEXPORTED_FUNCTIONS=_add,...` |
-| `clang` | `clang++` | `--target=wasm32-unknown-unknown -nostdlib -Wl,--no-entry`, exports as `-Wl,--export=add` |
+```
+clang++ -std=c++23 -O2 --target=wasm32-unknown-unknown \
+        -nostdlib -fno-exceptions -fno-rtti -Wl,--no-entry -Wl,--allow-undefined \
+        -Wl,--export=add -Wl,--export=factorial -o build/math.wasm src/Math.cpp
+```
 
-The clang path is the alternative to emscripten: it needs nothing but a stock
-LLVM with the WebAssembly backend and `wasm-ld`, which a recent `clang++` already
-ships with. In exchange the module is freestanding — no libc, no `_start`
-symbol, and every symbol the host should see has to be exported by name.
-
-The toolchain is picked in this order: the `--wasm-toolchain` flag, the `B3_WASM`
-environment variable, then emscripten if `em++` is on the `PATH`, and clang++ as
-the fallback. The compiler itself can be overridden with `EMXX` respectively
-`WASM_CXX`, and the `wasm` example skips itself when neither compiler is
-installed.
+The modules this produces are freestanding: no libc, no `_start` symbol, and
+every symbol the host should see has to be exported by name. Set `WASM_CXX` when
+the cross compiler is not simply called `clang++`; the `wasm` example skips
+itself when no compiler is found.
 
 ```sh
-./b3 wasm                            # whichever toolchain is installed
-./b3 wasm --wasm-toolchain clang     # force the freestanding clang++ path
-B3_WASM=emscripten ./b3 wasm         # force em++
+./b3 wasm
+WASM_CXX=clang++-18 ./b3 wasm
 ```
 
 ## Describing a build
@@ -111,14 +109,13 @@ A target with no outputs is phony and therefore always runs. A target is rebuilt
 when one of its outputs is missing, when an input is newer than the outputs, or
 when one of its dependencies was rebuilt.
 
-A WebAssembly module is described the same way, without spelling out the flags
-of either toolchain:
+A WebAssembly module is described the same way, without spelling out the flags:
 
 ```cpp
 b3::WasmModule module("build/math.wasm");
 module.source("src/Math.cpp").exportSymbol("add").exportSymbol("factorial");
 
-builder.addTarget(module.target("wasm", b3::detectWasmToolchain().value()));
+builder.addTarget(module.target("wasm"));
 ```
 
 ## Conventions

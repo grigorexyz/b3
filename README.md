@@ -97,12 +97,12 @@ WASM_CXX=clang++-18 ./b3 wasm
 b3::Builder builder;
 
 b3::Command compile;
-compile.appendAll(b3::compilerExecutable(), b3::kStandardFlag, b3::kCompileOnlyFlag,
+compile.AppendAll(b3::compiler_executable(), b3::kStandardFlag, b3::kCompileOnlyFlag,
                   "src/Main.cpp", b3::kOutputFlag, "build/Main.o");
 
 b3::Target object("compile:main");
-object.output("build/Main.o").input("src/Main.cpp").command(std::move(compile));
-builder.addTarget(std::move(object));
+object.Output("build/Main.o").Input("src/Main.cpp").AddCommand(std::move(compile));
+builder.AddTarget(std::move(object));
 ```
 
 A target with no outputs is phony and therefore always runs. A target is rebuilt
@@ -113,9 +113,9 @@ A WebAssembly module is described the same way, without spelling out the flags:
 
 ```cpp
 b3::WasmModule module("build/math.wasm");
-module.source("src/Math.cpp").exportSymbol("add").exportSymbol("factorial");
+module.Source("src/Math.cpp").ExportSymbol("add").ExportSymbol("factorial");
 
-builder.addTarget(module.target("wasm"));
+builder.AddTarget(module.AsTarget("wasm"));
 ```
 
 ## Conventions
@@ -126,17 +126,22 @@ builder.addTarget(module.target("wasm"));
   flag, the contents of a file — are copied once into `b3::text::Arena`, which
   owns them until the process exits.
 * Arena blocks are NUL terminated, so an interned view is also a valid
-  `const char*`: `Command::run` hands the very same characters to `execvp`
+  `const char*`: `Command::Run` hands the very same characters to `execvp`
   without a copy.
 * Log messages are formatted into a stack buffer with `std::format_to_n`, so
   even printing never allocates a string.
 * Every fixed string is a `constexpr std::string_view`, from the log prefixes and
-  the command line flags to the sources the examples write out; `Command::appendAll`
+  the command line flags to the sources the examples write out; `Command::AppendAll`
   accepts them directly.
-* `levelPrefix`, the flag comparisons and the example registry are `constexpr`,
+* `level_prefix`, the flag comparisons and the example registry are `constexpr`,
   and a handful of `static_assert`s check them at compile time.
-* Member variables use the `m_PascalCase` prefix, instances and functions use
-  `camelCase`, types use `PascalCase`.
+* Naming: types are `PascalCase` and so are their member functions
+  (`Command::Append`, `Builder::AddTarget`). Free functions are `snake_case`
+  (`log_info`, `fs::write_file`, `rebuild_yourself`). Member variables carry the
+  `m_PascalCase` prefix, and instances — including lambdas — are `camelCase`.
+* Two member functions are not named after what they do to avoid hiding a type
+  in class scope: `Target::AddCommand` takes a `Command`, and
+  `WasmModule::AsTarget` returns a `Target`.
 * `Command` and `Builder` hide their state behind the pImpl pattern; ownership
   elsewhere is expressed with standard containers and smart pointers.
 
